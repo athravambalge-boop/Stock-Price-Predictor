@@ -1,36 +1,88 @@
 # Stock Price Predictor
 
-A Streamlit app that downloads historical stock data, builds technical features, and trains an LSTM model to predict the next price movement for selected Indian stocks.
+Streamlit app for Nifty 50 stocks that combines multivariate LSTM forecasting, baseline model comparison, chart breakdown analysis, and model diagnostics.
 
-## Features
+## What The App Does
 
-- Select from TCS, Infosys, Reliance, and HDFC Bank
-- Choose a custom date range
-- Train an LSTM model on historical prices
-- View actual vs predicted prices and RMSE
-- Generate a next-day price prediction
+- Lets you select any current Nifty 50 stock.
+- Uses user-selected start date with end date fixed to the current date.
+- Downloads market data from Yahoo Finance.
+- Builds technical features (trend, momentum, volatility, and volume).
+- Trains an LSTM model to predict next-step log-return, then converts predictions back to price.
+- Compares LSTM against baseline models.
+- Displays chart breakdown with trendlines, support, resistance, and breakout level.
+
+## Key Features
+
+- Nifty 50 stock picker (no default preselection).
+- Price Summary panel:
+	- All-Time High/Low with date
+	- Selected Range High/Low with date
+	- 52-Week High/Low with date
+- Data and Model Health panel:
+	- Rows downloaded
+	- Date span and timeline size
+	- Rows after feature engineering
+	- Train/test sequence counts
+- Leakage-safe preprocessing:
+	- Scalers fit only on training data
+- Training reliability:
+	- EarlyStopping
+	- ReduceLROnPlateau
+	- ModelCheckpoint
+- Validation and diagnostics:
+	- Walk-forward validation (TimeSeriesSplit)
+	- RMSE, MAE, MAPE, directional accuracy
+	- Residual chart
+- Baseline comparison table:
+	- Naive (last close)
+	- Linear Regression
+	- Random Forest
+	- LSTM
+
+## Feature Engineering
+
+The app computes these indicators before training:
+
+- MA20, MA50, MA100, EMA20
+- RSI (14)
+- ATR (14)
+- Bollinger Upper/Lower/Width
+- VolumeChange
+- OBV
+- Volatility20
+
+## Chart Breakdown
+
+The breakdown chart includes:
+
+- Close price
+- Trendline (20)
+- Trendline (50)
+- Support line
+- Resistance line
+- Breakout level line
+- Breakout/Breakdown/Testing marker
 
 ## Project Structure
 
-- `app.py` - Streamlit interface for selecting stocks, dates, and training the model
-- `data_loader.py` - Downloads market data with yfinance
-- `preprocessing.py` - Adds features, scales data, and creates sequences
-- `models.py` - Defines the LSTM model
-- `train.py` - Trains the model and produces predictions
-- `main.py` - Simple script entry point for local plotting
+- `app.py`: Streamlit UI and end-to-end workflow
+- `data_loader.py`: Yahoo Finance downloader and column normalization
+- `preprocessing.py`: Feature engineering and leakage-safe sequence prep
+- `models.py`: LSTM architecture
+- `train.py`: Training utilities, evaluation, baselines, walk-forward CV
+- `main.py`: local script entry point
 
 ## Setup
 
-1. Create and activate a virtual environment.
+1. Create and activate a Python virtual environment.
 2. Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Run the App
-
-Start the Streamlit interface with:
+## Run
 
 ```bash
 streamlit run app.py
@@ -38,6 +90,6 @@ streamlit run app.py
 
 ## Notes
 
-- The app relies on live data from Yahoo Finance.
-- The model uses only the `Close` price for scaling and sequence generation.
-- Training can take a short time depending on the selected date range and machine performance.
+- Data quality and availability depend on Yahoo Finance.
+- If timeline is too short, training is blocked with a guided warning.
+- `best_lstm.keras` is a generated checkpoint file and should not be committed.
