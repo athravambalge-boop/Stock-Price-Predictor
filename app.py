@@ -3,6 +3,21 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import yfinance as yf
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
+from xml.etree import ElementTree as ET
+
+
+IST = timezone.utc
+try:
+    # Fixed offset for India Standard Time (UTC+05:30).
+    from datetime import timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+except Exception:
+    pass
 
 from data_loader import load_data
 from preprocessing import add_features, prepare_lstm_data
@@ -32,6 +47,334 @@ def get_cached_data(ticker, start, end):
 @st.cache_data(ttl=3600)
 def get_cached_features(data):
     return add_features(data.copy())
+
+
+def parse_datetime_safe(value):
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except Exception:
+            return None
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+
+        try:
+            parsed = parsedate_to_datetime(cleaned)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+        if cleaned.endswith("Z"):
+            cleaned = cleaned.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(cleaned)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    return None
+
+
+def format_datetime_utc(dt_obj):
+    if not dt_obj:
+        return "Time not available"
+    return dt_obj.astimezone(IST).strftime("%d %b %Y, %H:%M IST")
+
+
+def news_impact_score(headline, company_name, ticker_symbol):
+    text = (headline or "").lower()
+
+    high_impact_terms = [
+        "war", "missile", "attack", "ceasefire", "sanction", "geopolitical",
+        "election", "parliament", "congress", "government", "policy", "tariff",
+        "federal reserve", "fed", "rbi", "interest rate", "inflation", "cpi",
+        "opec", "oil", "crude", "recession", "gdp", "unemployment",
+    ]
+    medium_impact_terms = [
+        "market", "stocks", "equity", "bond", "currency", "rupee", "dollar",
+        "earnings", "guidance", "merger", "acquisition", "regulator", "sec",
+        "outlook", "forecast", "exports", "imports", "trade",
+    ]
+
+    score = 0
+    score += sum(3 for term in high_impact_terms if term in text)
+    score += sum(1 for term in medium_impact_terms if term in text)
+
+    company_terms = [
+        token.lower()
+        for token in company_name.replace("&", " ").replace("-", " ").split()
+        if len(token) > 2
+    ]
+    ticker_root = (ticker_symbol or "").replace(".NS", "").strip().lower()
+
+    if ticker_root and ticker_root in text:
+        score += 2
+    if any(term in text for term in company_terms):
+        score += 2
+
+    return score
+
+
+def market_impact_tags(headline):
+    text = (headline or "").lower()
+    tags = []
+
+    if any(word in text for word in ["war", "attack", "missile", "conflict", "ceasefire", "sanction", "geopolitical"]):
+        tags.append("Geopolitics")
+    if any(word in text for word in ["election", "government", "parliament", "policy", "tariff", "political"]):
+        tags.append("Politics")
+    if any(word in text for word in ["fed", "rbi", "interest rate", "inflation", "cpi", "central bank"]):
+        tags.append("Macro")
+    if any(word in text for word in ["oil", "crude", "opec", "gas"]):
+        tags.append("Commodities")
+    if any(word in text for word in ["earnings", "guidance", "results", "profit"]):
+        tags.append("Corporate")
+
+    if not tags:
+        tags.append("Markets")
+
+    return tags
+
+
+@st.cache_data(ttl=1800)
+def get_cached_news(ticker_symbol, limit=8):
+    try:
+        news_items = yf.Ticker(ticker_symbol).news or []
+    except Exception:
+        return []
+
+    parsed_items = []
+    for item in news_items:
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+
+        title = (
+            item.get("title")
+            or content.get("title")
+            or content.get("description")
+            or "Untitled headline"
+        )
+
+        link = item.get("link") or content.get("clickThroughUrl")
+        if isinstance(link, dict):
+            link = link.get("url")
+        if not link:
+            canonical = item.get("canonicalUrl") or content.get("canonicalUrl")
+            if isinstance(canonical, dict):
+                link = canonical.get("url")
+
+        publisher = (
+            item.get("publisher")
+            or (content.get("provider", {}) or {}).get("displayName")
+            or "Unknown source"
+        )
+
+        publish_time_raw = (
+            item.get("providerPublishTime")
+            or content.get("pubDate")
+            or content.get("displayTime")
+        )
+        parsed_dt = parse_datetime_safe(publish_time_raw)
+        published_at = format_datetime_utc(parsed_dt)
+
+        related_tickers = item.get("relatedTickers") or content.get("tickers")
+        if not isinstance(related_tickers, list):
+            related_tickers = []
+
+        parsed_items.append(
+            {
+                "title": title,
+                "link": link,
+                "publisher": publisher,
+                "published_at": published_at,
+                "published_dt": parsed_dt,
+                "related_tickers": related_tickers,
+            }
+        )
+
+        if len(parsed_items) >= limit:
+            break
+
+    return parsed_items
+
+
+@st.cache_data(ttl=1800)
+def get_moneycontrol_news(company_name, ticker_symbol, limit=8):
+    # Moneycontrol provides RSS feeds; fetch market/business streams and filter by selected stock.
+    feed_urls = [
+        "https://www.moneycontrol.com/rss/latestnews.xml",
+        "https://www.moneycontrol.com/rss/business.xml",
+        "https://www.moneycontrol.com/rss/marketreports.xml",
+    ]
+
+    query_terms = [t.lower() for t in company_name.replace("&", " ").replace("-", " ").split() if len(t) > 2]
+    ticker_root = (ticker_symbol or "").replace(".NS", "").strip().lower()
+    if ticker_root:
+        query_terms.append(ticker_root)
+
+    parsed_items = []
+    seen_links = set()
+
+    for feed_url in feed_urls:
+        try:
+            request = Request(feed_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request, timeout=8) as response:
+                xml_payload = response.read()
+            root = ET.fromstring(xml_payload)
+        except Exception:
+            continue
+
+        for node in root.findall(".//item"):
+            title = (node.findtext("title") or "").strip()
+            link = (node.findtext("link") or "").strip()
+            raw_pubdate = (node.findtext("pubDate") or "").strip()
+            parsed_dt = parse_datetime_safe(raw_pubdate)
+            published_at = format_datetime_utc(parsed_dt)
+
+            if not title or not link or link in seen_links:
+                continue
+
+            text_blob = f"{title} {link}".lower()
+            relevance = any(term in text_blob for term in query_terms)
+
+            parsed_items.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "publisher": "Moneycontrol",
+                    "published_at": published_at,
+                    "published_dt": parsed_dt,
+                    "related_tickers": [ticker_symbol] if relevance else [],
+                    "relevance": relevance,
+                }
+            )
+            seen_links.add(link)
+
+    parsed_items.sort(
+        key=lambda x: (
+            x["relevance"],
+            x.get("published_dt") or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        ),
+        reverse=True,
+    )
+    return parsed_items[:limit]
+
+
+@st.cache_data(ttl=900)
+def get_global_market_news(company_name, ticker_symbol, limit=24):
+    search_queries = [
+        f"{company_name} stock market",
+        "global stock market today",
+        "war and geopolitics impact on markets",
+        "political news impact on markets",
+        "oil crude and commodities market moves",
+        "central bank inflation interest rates markets",
+        "india politics and markets",
+    ]
+
+    feed_urls = [
+        f"https://news.google.com/rss/search?q={quote_plus(query + ' when:1d')}&hl=en-IN&gl=IN&ceid=IN:en"
+        for query in search_queries
+    ]
+
+    parsed_items = []
+    seen_links = set()
+
+    for feed_url in feed_urls:
+        try:
+            request = Request(feed_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request, timeout=10) as response:
+                xml_payload = response.read()
+            root = ET.fromstring(xml_payload)
+        except Exception:
+            continue
+
+        for node in root.findall(".//item"):
+            title = (node.findtext("title") or "").strip()
+            link = (node.findtext("link") or "").strip()
+            publisher = (node.findtext("source") or "Google News").strip() or "Google News"
+            parsed_dt = parse_datetime_safe(node.findtext("pubDate") or "")
+
+            if not title or not link or link in seen_links:
+                continue
+
+            parsed_items.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "publisher": publisher,
+                    "published_at": format_datetime_utc(parsed_dt),
+                    "published_dt": parsed_dt,
+                    "related_tickers": [],
+                }
+            )
+            seen_links.add(link)
+
+    parsed_items.sort(
+        key=lambda x: x.get("published_dt") or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return parsed_items[:limit]
+
+
+@st.cache_data(ttl=900)
+def get_market_impact_news(company_name, ticker_symbol, limit=20, only_today=True):
+    yahoo_news = get_cached_news(ticker_symbol, limit=12)
+    moneycontrol_news = get_moneycontrol_news(company_name, ticker_symbol, limit=12)
+    global_news = get_global_market_news(company_name, ticker_symbol, limit=36)
+
+    all_news = yahoo_news + moneycontrol_news + global_news
+
+    local_now = datetime.now().astimezone()
+    today_local = local_now.date()
+
+    deduped = {}
+    for item in all_news:
+        title = (item.get("title") or "").strip()
+        link = (item.get("link") or "").strip()
+        if not title:
+            continue
+
+        published_dt = item.get("published_dt")
+        if only_today and published_dt is not None:
+            if published_dt.astimezone(local_now.tzinfo).date() != today_local:
+                continue
+
+        key = (title.lower(), link)
+        score = news_impact_score(title, company_name, ticker_symbol)
+        tags = market_impact_tags(title)
+
+        enriched = {
+            "title": title,
+            "link": link,
+            "publisher": item.get("publisher", "Unknown source"),
+            "published_at": item.get("published_at", "Time not available"),
+            "published_dt": published_dt,
+            "related_tickers": item.get("related_tickers", []),
+            "impact_score": score,
+            "impact_tags": tags,
+        }
+
+        existing = deduped.get(key)
+        if not existing or enriched["impact_score"] > existing["impact_score"]:
+            deduped[key] = enriched
+
+    merged = list(deduped.values())
+    merged.sort(
+        key=lambda x: (
+            x["impact_score"],
+            x.get("published_dt") or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        ),
+        reverse=True,
+    )
+
+    return merged[:limit]
 
 
 def find_swing_levels(series, window=3, tail_points=8):
@@ -152,6 +495,11 @@ def style_time_axis(ax, date_index):
 # ==============================
 st.title("📈 Nifty 50 Stock Price Predictor (Multivariate LSTM)")
 st.write("Select any Nifty 50 company and predict trends using Close, MA50, MA100, and RSI")
+st.warning(
+    "Disclaimer: This app is for educational and informational use only. "
+    "It does not provide financial advice, investment recommendations, or guarantees. "
+    "Market data and news may be delayed or incomplete. Always do your own research before investing."
+)
 
 # ==============================
 # 📊 STOCK OPTIONS
@@ -223,11 +571,6 @@ if not selected_stock:
 ticker = stock_options[selected_stock]
 
 st.caption("Covered companies: all current Nifty 50 constituents")
-
-from datetime import datetime
-
-# Date selectors
-from datetime import datetime
 
 today = datetime.today()
 
@@ -319,6 +662,36 @@ week_col2.metric(
     f"▼ {fifty_two_week_low_date.strftime('%d %b %Y')}",
     delta_color="inverse"
 )
+
+st.subheader("Today's Market-Moving News")
+market_news = get_market_impact_news(selected_stock, ticker, limit=20, only_today=True)
+
+if market_news:
+    st.caption(
+        "Sources: Yahoo Finance, Moneycontrol, and Google News market searches. "
+        "Feed is filtered to today and prioritized by market impact (war, geopolitics, politics, macro, commodities, and company-specific updates)."
+    )
+    for news in market_news:
+        headline = news["title"]
+        link = news["link"]
+        publisher = news["publisher"]
+        published_at = news["published_at"]
+        related_tickers = news["related_tickers"]
+        tags = news.get("impact_tags", [])
+
+        if link:
+            st.markdown(f"- [{headline}]({link})")
+        else:
+            st.markdown(f"- {headline}")
+
+        metadata = f"{publisher} • {published_at}"
+        if tags:
+            metadata += f" • Tags: {', '.join(tags[:3])}"
+        if related_tickers:
+            metadata += f" • Related: {', '.join(related_tickers[:5])}"
+        st.caption(metadata)
+else:
+    st.info("No market-impact headlines from today are available right now. Please check again later.")
 
 st.subheader("Data & Model Health")
 health_col1, health_col2, health_col3, health_col4 = st.columns(4)
