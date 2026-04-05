@@ -11,6 +11,7 @@ Streamlit app for Nifty 50 stocks that combines multivariate LSTM forecasting, b
 - Trains an LSTM model to predict next-step log-return, then converts predictions back to price.
 - Compares LSTM against baseline models.
 - Displays chart breakdown with trendlines, support, resistance, and breakout level.
+- Shows a unified market-impact news feed for the selected stock.
 
 ## Key Features
 
@@ -39,6 +40,23 @@ Streamlit app for Nifty 50 stocks that combines multivariate LSTM forecasting, b
 	- Linear Regression
 	- Random Forest
 	- LSTM
+- Market-impact news panel:
+	- Today-only headline filter
+	- Multi-source aggregation (Yahoo Finance, Moneycontrol, Google News RSS)
+	- Impact tags (Geopolitics, Politics, Macro, Commodities, Corporate)
+	- Timestamp display in IST
+
+## Market News Feed
+
+The app includes a "Today's Market-Moving News" section that prioritizes headlines likely to affect markets.
+
+- Aggregates from:
+	- Yahoo Finance ticker feed
+	- Moneycontrol RSS feeds
+	- Google News RSS market searches
+- Filters to today's items and removes duplicates across sources.
+- Prioritizes headlines using impact keywords (for example war, geopolitics, policy, interest rates, oil, inflation, and earnings).
+- Displays news times in IST.
 
 ## Feature Engineering
 
