@@ -31,15 +31,25 @@ Streamlit app for Nifty 50 stocks that combines multivariate LSTM forecasting, b
 	- EarlyStopping
 	- ReduceLROnPlateau
 	- ModelCheckpoint
+- Reproducible runs:
+	- User-controlled random seed
+	- Seeded NumPy, TensorFlow, and tree-based baselines
 - Validation and diagnostics:
-	- Walk-forward validation (TimeSeriesSplit)
+	- Leakage-safe walk-forward validation (TimeSeriesSplit)
 	- RMSE, MAE, MAPE, directional accuracy
+	- Bootstrap 95% confidence intervals for metrics
 	- Residual chart
 - Baseline comparison table:
 	- Naive (last close)
+	- Seasonal Naive (5-step average)
 	- Linear Regression
 	- Random Forest
 	- LSTM
+- Forecast uncertainty:
+	- Residual-based next-day prediction range
+	- Random Forest predictive dispersion estimate
+- Experiment tracking:
+	- Auto-logs training runs to `artifacts/experiment_log.csv`
 - Market-impact news panel:
 	- Today-only headline filter
 	- Multi-source aggregation (Yahoo Finance, Moneycontrol, Google News RSS)
@@ -90,6 +100,7 @@ The breakdown chart includes:
 - `models.py`: LSTM architecture
 - `train.py`: Training utilities, evaluation, baselines, walk-forward CV
 - `main.py`: local script entry point
+- `tests/`: unit tests for data loading, preprocessing, and metrics
 
 ## Setup
 
@@ -100,14 +111,53 @@ The breakdown chart includes:
 pip install -r requirements.txt
 ```
 
-## Run
+### Windows (PowerShell)
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### macOS/Linux
 
 ```bash
-streamlit run app.py
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Run
+
+Use the Python module form to ensure Streamlit runs from the active environment:
+
+```bash
+python -m streamlit run app.py
+```
+
+If you have multiple Python installations, use the venv interpreter directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+## Run Tests
+
+```bash
+pytest -q
+```
+
+## Troubleshooting
+
+- Error: No module named streamlit
+- Fix: install dependencies inside your virtual environment and run Streamlit via python -m streamlit.
+- Verify install:
+
+```bash
+python -m streamlit --version
 ```
 
 ## Notes
 
 - Data quality and availability depend on Yahoo Finance.
 - If timeline is too short, training is blocked with a guided warning.
-- `best_lstm.keras` is a generated checkpoint file and should not be committed.
+- Model checkpoints and experiment logs are written to `artifacts/` and should not be committed.
+- Evaluation metrics are computed on holdout data; next-day forecast is produced by retraining on full available history.

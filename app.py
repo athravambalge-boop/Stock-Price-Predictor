@@ -1,4 +1,5 @@
 import streamlit as st
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -20,7 +21,7 @@ except Exception:
     pass
 
 from data_loader import load_data
-from preprocessing import add_features, prepare_lstm_data
+from preprocessing import add_features, prepare_lstm_data, prepare_full_training_data, build_sequence_dataset
 from models import build_lstm
 from train import (
     train_lstm,
@@ -28,7 +29,8 @@ from train import (
     returns_to_price,
     evaluate_forecast,
     baseline_predictions,
-    walk_forward_cv_rmse,
+    walk_forward_cv_rmse_leakage_safe,
+    set_global_seed,
 )
 
 
@@ -42,6 +44,11 @@ def extract_close_series(data):
 @st.cache_data(ttl=3600)
 def get_cached_data(ticker, start, end):
     return load_data(ticker, start=start, end=end)
+
+
+@st.cache_data(ttl=43200)
+def get_cached_full_history(ticker, end):
+    return load_data(ticker, start="1900-01-01", end=end)
 
 
 @st.cache_data(ttl=3600)
@@ -490,6 +497,19 @@ def style_time_axis(ax, date_index):
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(formatter)
 
+
+def append_experiment_log(record):
+    os.makedirs("artifacts", exist_ok=True)
+    log_path = os.path.join("artifacts", "experiment_log.csv")
+    record_df = pd.DataFrame([record])
+
+    if os.path.exists(log_path):
+        existing = pd.read_csv(log_path)
+        combined = pd.concat([existing, record_df], ignore_index=True)
+        combined.to_csv(log_path, index=False)
+    else:
+        record_df.to_csv(log_path, index=False)
+
 # ==============================
 # 🎯 TITLE
 # ==============================
@@ -583,6 +603,8 @@ start_date = st.date_input(
 end_date = today.date()
 st.caption(f"End Date is fixed to current date: {end_date.strftime('%d %b %Y')}")
 
+seed = st.number_input("Random Seed", min_value=1, max_value=999999, value=42, step=1)
+
 if start_date >= end_date:
     st.error("Start date must be before current date")
     st.stop()
@@ -592,7 +614,7 @@ if start_date >= end_date:
 # ==============================
 data = get_cached_data(ticker, start=start_date, end=end_date)
 raw_data = data.copy()
-full_history = get_cached_data(ticker, start="1900-01-01", end=today)
+full_history = get_cached_full_history(ticker, end=today)
 
 if raw_data.empty or extract_close_series(raw_data).empty:
     st.error("No price data found for the selected timeline. Please choose an earlier start date.")
@@ -604,8 +626,8 @@ full_close = extract_close_series(full_history)
 selected_close = extract_close_series(raw_data)
 
 if full_close.empty:
-    st.error("Unable to fetch full historical data for this stock at the moment. Please try again.")
-    st.stop()
+    st.warning("Full historical series is unavailable right now; using selected timeline for all-time metrics.")
+    full_close = selected_close.copy()
 
 all_time_high_date = full_close.idxmax()
 all_time_high = float(full_close.max())
@@ -733,6 +755,13 @@ y_test_price = lstm_data['y_test_price']
 prev_close_test = lstm_data['prev_close_test']
 dates_test = lstm_data['dates_test']
 
+raw_sequence_bundle = build_sequence_dataset(
+    processed_data,
+    feature_cols=feature_cols,
+    target_col='LogReturn',
+    sequence_length=60,
+)
+
 health_pre_col1, health_pre_col2, health_pre_col3 = st.columns(3)
 health_pre_col1.metric("Rows After Features", f"{len(processed_data)}")
 health_pre_col2.metric("Train Sequences", f"{len(X_train)}")
@@ -749,8 +778,15 @@ if st.session_state.get("trained_context") != training_context:
 if st.button("Train Model"):
 
     with st.spinner("Training model... ⏳"):
-        model = build_lstm(X_train.shape[1:])
-        model, history = train_lstm(model, X_train, y_train)
+        set_global_seed(int(seed))
+
+        model = build_lstm(X_train.shape[1:], seed=int(seed))
+        model, history = train_lstm(
+            model,
+            X_train,
+            y_train,
+            checkpoint_path=os.path.join("artifacts", f"{ticker.replace('.', '_')}_eval_best.keras"),
+        )
 
         pred_returns = predict_lstm(model, X_test, target_scaler)
         pred_price = returns_to_price(pred_returns, prev_close_test)
@@ -758,30 +794,82 @@ if st.button("Train Model"):
 
         lstm_metrics = evaluate_forecast(actual_price, pred_price, prev_close_test)
 
-        cv_result = walk_forward_cv_rmse(build_lstm, X_train, y_train, target_scaler, n_splits=3)
+        cv_result = walk_forward_cv_rmse_leakage_safe(
+            lambda input_shape: build_lstm(input_shape, seed=int(seed)),
+            raw_sequence_bundle['X_raw'],
+            raw_sequence_bundle['y_raw'],
+            n_splits=3,
+            epochs=20,
+            batch_size=32,
+        )
 
-        baseline = baseline_predictions(X_train, y_train, X_test, prev_close_test)
+        baseline = baseline_predictions(X_train, y_train, X_test, prev_close_test, random_state=int(seed))
         lr_returns = target_scaler.inverse_transform(baseline['linear_return'])
         rf_returns = target_scaler.inverse_transform(baseline['rf_return'])
         lr_price = returns_to_price(lr_returns, prev_close_test)
         rf_price = returns_to_price(rf_returns, prev_close_test)
+        seasonal_price = baseline['seasonal_naive_close']
 
         baseline_metrics = {
             'Naive (Last Close)': evaluate_forecast(actual_price, baseline['naive_close'], prev_close_test),
+            'Seasonal Naive (5)': evaluate_forecast(actual_price, seasonal_price, prev_close_test),
             'Linear Regression': evaluate_forecast(actual_price, lr_price, prev_close_test),
             'Random Forest': evaluate_forecast(actual_price, rf_price, prev_close_test),
             'LSTM': lstm_metrics,
         }
 
-    st.success("Model trained successfully!")
+        # Production model retrains on all available data before the next-day forecast.
+        full_training = prepare_full_training_data(
+            processed_data,
+            feature_cols=feature_cols,
+            target_col='LogReturn',
+            sequence_length=60,
+        )
+        prod_model = build_lstm(full_training['X_all'].shape[1:], seed=int(seed))
+        prod_model, _ = train_lstm(
+            prod_model,
+            full_training['X_all'],
+            full_training['y_all'],
+            checkpoint_path=os.path.join("artifacts", f"{ticker.replace('.', '_')}_prod_best.keras"),
+        )
 
-    # Next-day prediction from most recent scaled feature window
-    latest_feature_window = np.array(processed_data[feature_cols].tail(60).values).reshape(1, 60, len(feature_cols))
-    latest_feature_window_scaled = lstm_data['feature_scaler'].transform(
-        latest_feature_window.reshape(-1, latest_feature_window.shape[-1])
-    ).reshape(latest_feature_window.shape)
-    next_day_return = predict_lstm(model, latest_feature_window_scaled, target_scaler)
-    next_day_price = returns_to_price(next_day_return, [[float(processed_data['Close'].iloc[-1])]])
+        next_day_return = predict_lstm(
+            prod_model,
+            full_training['latest_feature_window'],
+            full_training['target_scaler'],
+        )
+        next_day_price = returns_to_price(next_day_return, [[full_training['last_close']]])
+
+        residuals = lstm_metrics['residuals']
+        low_q, high_q = np.percentile(residuals, [5, 95])
+        next_price_point = float(next_day_price[0][0])
+        next_price_interval = (next_price_point + low_q, next_price_point + high_q)
+
+        rf_return_std = baseline['rf_return_std']
+        rf_price_std = np.array(prev_close_test).reshape(-1, 1) * np.exp(rf_returns) * rf_return_std
+        rf_uncertainty = float(np.nanmean(rf_price_std)) if len(rf_price_std) else np.nan
+
+        append_experiment_log(
+            {
+                'timestamp': datetime.now().isoformat(),
+                'ticker': ticker,
+                'start_date': str(start_date),
+                'end_date': str(end_date),
+                'seed': int(seed),
+                'train_sequences': int(len(X_train)),
+                'test_sequences': int(len(X_test)),
+                'rmse': float(lstm_metrics['rmse']),
+                'mae': float(lstm_metrics['mae']),
+                'mape': float(lstm_metrics['mape']),
+                'directional_accuracy': float(lstm_metrics['directional_accuracy']),
+                'cv_mean_rmse': float(cv_result['mean_rmse']),
+                'next_day_price': next_price_point,
+                'next_day_ci_low': float(next_price_interval[0]),
+                'next_day_ci_high': float(next_price_interval[1]),
+            }
+        )
+
+    st.success("Model trained successfully!")
 
     st.session_state["trained_outputs"] = {
         "rmse": float(lstm_metrics['rmse']),
@@ -789,7 +877,8 @@ if st.button("Train Model"):
         "mape": float(lstm_metrics['mape']),
         "directional_accuracy": float(lstm_metrics['directional_accuracy']),
         "current_price": float(selected_close.iloc[-1]),
-        "next_price": float(next_day_price[0][0]),
+        "next_price": next_price_point,
+        "next_price_interval": (float(next_price_interval[0]), float(next_price_interval[1])),
         "dates": dates_test,
         "actual_price": actual_price,
         "pred_price": pred_price,
@@ -797,6 +886,9 @@ if st.button("Train Model"):
         "baseline_metrics": baseline_metrics,
         "cv_result": cv_result,
         "history": history.history,
+        "seed": int(seed),
+        "ci95": lstm_metrics.get('ci95', {}),
+        "rf_price_std": rf_uncertainty,
     }
 
 trained_outputs = st.session_state.get("trained_outputs")
@@ -814,7 +906,25 @@ if trained_outputs:
     metric_col1, metric_col2 = st.columns(2)
     metric_col1.metric("MAE", f"{trained_outputs['mae']:.2f}")
     metric_col2.metric("MAPE", f"{trained_outputs['mape']:.2f}%")
-    st.caption("Prediction target: next-day close price inferred from predicted log-return")
+    st.caption(
+        "Prediction target: next-day close price inferred from predicted log-return. "
+        f"Run seed: {trained_outputs['seed']}"
+    )
+
+    interval_low, interval_high = trained_outputs['next_price_interval']
+    st.info(f"Next-day uncertainty range (residual 90% band): ₹{interval_low:.2f} to ₹{interval_high:.2f}")
+
+    ci95 = trained_outputs.get('ci95', {})
+    if ci95 and ci95.get('rmse'):
+        rmse_low, rmse_high = ci95['rmse']
+        mae_low, mae_high = ci95['mae']
+        st.caption(
+            "Bootstrap 95% confidence intervals "
+            f"RMSE: [{rmse_low:.2f}, {rmse_high:.2f}], "
+            f"MAE: [{mae_low:.2f}, {mae_high:.2f}]"
+        )
+    if np.isfinite(trained_outputs.get('rf_price_std', np.nan)):
+        st.caption(f"Random Forest average predictive dispersion: ±₹{trained_outputs['rf_price_std']:.2f}")
 
     # ==============================
     # 📉 GRAPH WITH REAL DATES

@@ -48,7 +48,7 @@ def create_sequences(features, target, sequence_length=60):
     return np.array(X), np.array(y)
 
 
-def prepare_lstm_data(data, feature_cols, target_col='LogReturn', sequence_length=60, train_ratio=0.8):
+def build_sequence_dataset(data, feature_cols, target_col='LogReturn', sequence_length=60):
     features = data[feature_cols].values
     target = data[[target_col]].values
     close = data['Close'].values
@@ -56,17 +56,34 @@ def prepare_lstm_data(data, feature_cols, target_col='LogReturn', sequence_lengt
 
     X, y, y_price, prev_close, y_dates = [], [], [], [], []
     for i in range(sequence_length, len(data)):
-        X.append(features[i-sequence_length:i])
+        X.append(features[i - sequence_length:i])
         y.append(target[i])
         y_price.append(close[i])
-        prev_close.append(close[i-1])
+        prev_close.append(close[i - 1])
         y_dates.append(dates[i])
 
-    X = np.array(X)
-    y = np.array(y)
-    y_price = np.array(y_price).reshape(-1, 1)
-    prev_close = np.array(prev_close).reshape(-1, 1)
-    y_dates = np.array(y_dates)
+    return {
+        'X_raw': np.array(X),
+        'y_raw': np.array(y),
+        'y_price': np.array(y_price).reshape(-1, 1),
+        'prev_close': np.array(prev_close).reshape(-1, 1),
+        'dates': np.array(y_dates),
+    }
+
+
+def prepare_lstm_data(data, feature_cols, target_col='LogReturn', sequence_length=60, train_ratio=0.8):
+    sequence_bundle = build_sequence_dataset(
+        data,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        sequence_length=sequence_length,
+    )
+
+    X = sequence_bundle['X_raw']
+    y = sequence_bundle['y_raw']
+    y_price = sequence_bundle['y_price']
+    prev_close = sequence_bundle['prev_close']
+    y_dates = sequence_bundle['dates']
 
     split = int(train_ratio * len(X))
 
@@ -96,4 +113,39 @@ def prepare_lstm_data(data, feature_cols, target_col='LogReturn', sequence_lengt
         'feature_scaler': feature_scaler,
         'target_scaler': target_scaler,
         'split_index': split,
+    }
+
+
+def prepare_full_training_data(data, feature_cols, target_col='LogReturn', sequence_length=60):
+    sequence_bundle = build_sequence_dataset(
+        data,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        sequence_length=sequence_length,
+    )
+
+    X_all_raw = sequence_bundle['X_raw']
+    y_all_raw = sequence_bundle['y_raw']
+
+    feature_scaler = MinMaxScaler(feature_range=(0, 1))
+    X_all_2d = X_all_raw.reshape(-1, X_all_raw.shape[-1])
+    feature_scaler.fit(X_all_2d)
+    X_all_scaled = feature_scaler.transform(X_all_2d).reshape(X_all_raw.shape)
+
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaler.fit(y_all_raw)
+    y_all_scaled = target_scaler.transform(y_all_raw)
+
+    latest_feature_window = np.array(data[feature_cols].tail(sequence_length).values).reshape(1, sequence_length, len(feature_cols))
+    latest_feature_window_scaled = feature_scaler.transform(
+        latest_feature_window.reshape(-1, latest_feature_window.shape[-1])
+    ).reshape(latest_feature_window.shape)
+
+    return {
+        'X_all': X_all_scaled,
+        'y_all': y_all_scaled,
+        'feature_scaler': feature_scaler,
+        'target_scaler': target_scaler,
+        'latest_feature_window': latest_feature_window_scaled,
+        'last_close': float(data['Close'].iloc[-1]),
     }
