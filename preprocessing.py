@@ -5,35 +5,71 @@ from sklearn.preprocessing import MinMaxScaler
 def add_features(data):
     enriched = data.copy()
 
+    # Moving Averages
     enriched['MA20'] = enriched['Close'].rolling(window=20).mean()
     enriched['MA50'] = enriched['Close'].rolling(window=50).mean()
     enriched['MA100'] = enriched['Close'].rolling(window=100).mean()
     enriched['EMA20'] = enriched['Close'].ewm(span=20, adjust=False).mean()
+    enriched['EMA50'] = enriched['Close'].ewm(span=50, adjust=False).mean()
 
+    # RSI (Relative Strength Index)
     delta = enriched['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     enriched['RSI'] = 100 - (100 / (1 + rs))
 
+    # ATR (Average True Range)
     high_low = enriched['High'] - enriched['Low']
     high_close_prev = (enriched['High'] - enriched['Close'].shift(1)).abs()
     low_close_prev = (enriched['Low'] - enriched['Close'].shift(1)).abs()
     true_range = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
     enriched['ATR14'] = true_range.rolling(window=14).mean()
 
+    # Bollinger Bands
     rolling_std20 = enriched['Close'].rolling(window=20).std()
     enriched['BollingerUpper'] = enriched['MA20'] + 2 * rolling_std20
     enriched['BollingerLower'] = enriched['MA20'] - 2 * rolling_std20
     enriched['BollingerWidth'] = (enriched['BollingerUpper'] - enriched['BollingerLower']) / enriched['MA20']
 
+    # MACD (Moving Average Convergence Divergence)
+    ema12 = enriched['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = enriched['Close'].ewm(span=26, adjust=False).mean()
+    enriched['MACD'] = ema12 - ema26
+    enriched['MACD_Signal'] = enriched['MACD'].ewm(span=9, adjust=False).mean()
+    enriched['MACD_Histogram'] = enriched['MACD'] - enriched['MACD_Signal']
+
+    # Stochastic Oscillator
+    low14 = enriched['Low'].rolling(window=14).min()
+    high14 = enriched['High'].rolling(window=14).max()
+    enriched['Stochastic_K'] = 100 * ((enriched['Close'] - low14) / (high14 - low14))
+    enriched['Stochastic_D'] = enriched['Stochastic_K'].rolling(window=3).mean()
+
+    # Volume indicators
     enriched['VolumeChange'] = enriched['Volume'].pct_change()
     direction = np.sign(enriched['Close'].diff()).fillna(0)
     enriched['OBV'] = (direction * enriched['Volume']).fillna(0).cumsum()
+    enriched['OBV_EMA'] = enriched['OBV'].ewm(span=20, adjust=False).mean()
 
+    # Price-based features
     enriched['Return1'] = enriched['Close'].pct_change()
     enriched['LogReturn'] = np.log(enriched['Close'] / enriched['Close'].shift(1))
     enriched['Volatility20'] = enriched['LogReturn'].rolling(window=20).std()
+    
+    # Additional lag features
+    enriched['Close_Lag1'] = enriched['Close'].shift(1)
+    enriched['Close_Lag5'] = enriched['Close'].shift(5)
+    enriched['Return_Lag1'] = enriched['Return1'].shift(1)
+    enriched['Return_Lag5'] = enriched['Return1'].shift(5)
+    
+    # Williams %R
+    enriched['Williams_R'] = -100 * ((high14 - enriched['Close']) / (high14 - low14))
+    
+    # CCI (Commodity Channel Index)
+    tp = (enriched['High'] + enriched['Low'] + enriched['Close']) / 3
+    sma_tp = tp.rolling(window=20).mean()
+    mad = tp.rolling(window=20).apply(lambda x: np.abs(x - x.mean()).mean())
+    enriched['CCI'] = (tp - sma_tp) / (0.015 * mad)
 
     enriched.replace([np.inf, -np.inf], np.nan, inplace=True)
     enriched.dropna(inplace=True)

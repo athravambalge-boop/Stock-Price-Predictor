@@ -35,7 +35,7 @@ def train_lstm(
     X_train,
     y_train,
     validation_split=0.15,
-    epochs=60,
+    epochs=100,
     batch_size=32,
     checkpoint_path='artifacts/best_lstm.keras',
 ):
@@ -44,8 +44,8 @@ def train_lstm(
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     callbacks = [
-        EarlyStopping(monitor='val_loss', patience=8, restore_best_weights=True),
-        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=4, min_lr=1e-5),
+        EarlyStopping(monitor='val_loss', patience=12, restore_best_weights=True, min_delta=1e-5),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=1e-6),
         ModelCheckpoint(checkpoint_path, monitor='val_loss', save_best_only=True, verbose=0),
     ]
     history = model.fit(
@@ -63,6 +63,83 @@ def train_lstm(
 def predict_lstm(model, X_test, target_scaler):
     pred_scaled = model.predict(X_test, verbose=0)
     return target_scaler.inverse_transform(pred_scaled)
+
+
+def predict_multi_step_lstm(model, last_sequence, feature_scaler, target_scaler, processed_data, feature_cols, n_steps=10):
+    """
+    Predict next n_steps ahead using a more stable approach.
+    Uses recent historical patterns rather than pure recursion to avoid model drift.
+    
+    Args:
+        model: Trained LSTM model
+        last_sequence: Last 60-day feature sequence (shape: 1, 60, num_features)
+        feature_scaler: MinMaxScaler for features
+        target_scaler: MinMaxScaler for target
+        processed_data: Full processed dataframe
+        feature_cols: List of feature column names
+        n_steps: Number of days to forecast (default 10)
+    
+    Returns:
+        List of (date, predicted_price) tuples
+    """
+    from datetime import datetime, timedelta
+    import pandas as pd
+    
+    predictions = []
+    last_close = processed_data['Close'].iloc[-1]
+    last_date = processed_data.index[-1]
+    
+    # Get recent average volatility and trend for more realistic predictions
+    recent_returns = processed_data['LogReturn'].tail(20).values
+    avg_return = np.nanmean(recent_returns)
+    return_std = np.nanstd(recent_returns)
+    
+    # Get recent price momentum
+    recent_prices = processed_data['Close'].tail(10).values
+    price_trend = (recent_prices[-1] - recent_prices[0]) / recent_prices[0]
+    
+    current_price = last_close
+    current_sequence = last_sequence.copy()
+    
+    for step in range(n_steps):
+        # Predict next return using the model
+        pred_return_scaled = model.predict(current_sequence, verbose=0)[0, 0]
+        pred_return = target_scaler.inverse_transform([[pred_return_scaled]])[0, 0]
+        
+        # Apply some smoothing to avoid unrealistic drift
+        # Use 70% model prediction + 30% historical average
+        smoothed_return = 0.7 * pred_return + 0.3 * avg_return
+        
+        # Convert return to price
+        pred_price = current_price * np.exp(smoothed_return)
+        
+        # Ensure price doesn't go too far from reasonable bounds
+        max_price = current_price * 1.05  # Max 5% move per day
+        min_price = current_price * 0.95  # Min 5% drop per day
+        pred_price = np.clip(pred_price, min_price, max_price)
+        
+        # Calculate next date (skip weekends)
+        next_date = last_date + timedelta(days=step + 1)
+        while next_date.weekday() >= 5:  # Skip weekends
+            next_date += timedelta(days=1)
+        
+        predictions.append({
+            'date': next_date,
+            'price': float(pred_price),
+            'return': float(smoothed_return * 100)  # As percentage
+        })
+        
+        # Update for next iteration using recent feature patterns
+        # Use recent average features to maintain stability
+        recent_features = processed_data[feature_cols].tail(10).mean().values
+        new_feature_vector = recent_features.reshape(1, 1, -1)
+        new_feature_vector_scaled = feature_scaler.transform(new_feature_vector.reshape(-1, new_feature_vector.shape[-1])).reshape(new_feature_vector.shape)
+        
+        # Shift the sequence
+        current_sequence = np.concatenate([current_sequence[:, 1:, :], new_feature_vector_scaled], axis=1)
+        current_price = pred_price
+    
+    return predictions
 
 
 def returns_to_price(pred_returns, prev_close):

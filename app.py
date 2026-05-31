@@ -26,6 +26,7 @@ from models import build_lstm
 from train import (
     train_lstm,
     predict_lstm,
+    predict_multi_step_lstm,
     returns_to_price,
     evaluate_forecast,
     baseline_predictions,
@@ -522,8 +523,101 @@ st.warning(
 )
 
 # ==============================
-# 📊 STOCK OPTIONS
+# � GLOBAL MARKET NEWS (Before Stock Selection)
 # ==============================
+st.subheader("📰 Today's Trending News")
+st.caption("Market news affecting Indian stocks")
+
+# Get more news to find trending stories
+global_news = get_global_market_news("Nifty 50", "NIFTY.NS", limit=50)
+
+if global_news:
+    # Count occurrences of each headline
+    headline_count = {}
+    for news in global_news:
+        title = news["title"].lower()
+        if title not in headline_count:
+            headline_count[title] = []
+        headline_count[title].append(news)
+    
+    # Filter to show only headlines appearing 2+ times, or top news if fewer available
+    trending_news = []
+    for title, news_list in headline_count.items():
+        if len(news_list) >= 2:
+            trending_news.append({
+                'title': news_list[0]['title'],
+                'link': news_list[0]['link'],
+                'count': len(news_list),
+                'publishers': [n['publisher'] for n in news_list],
+                'published_at': news_list[0]['published_at']
+            })
+    
+    # If less than 5 trending (2+ sources), add top single-source news
+    if len(trending_news) < 5:
+        for title, news_list in headline_count.items():
+            if len(news_list) == 1 and len(trending_news) < 5:
+                trending_news.append({
+                    'title': news_list[0]['title'],
+                    'link': news_list[0]['link'],
+                    'count': 1,
+                    'publishers': [n['publisher'] for n in news_list],
+                    'published_at': news_list[0]['published_at']
+                })
+    
+    if trending_news:
+        for news in trending_news[:5]:
+            headline = news['title']
+            link = news['link']
+            count = news['count']
+            publishers = set(news['publishers'])
+            published_at = news['published_at']
+
+            if link:
+                st.markdown(f"• [{headline}]({link})")
+            else:
+                st.markdown(f"• {headline}")
+
+            if count > 1:
+                metadata = f"📊 Reported by {count} sources: {', '.join(list(publishers)[:3])} • {published_at}"
+            else:
+                metadata = f"📰 {', '.join(list(publishers)[:1])} • {published_at}"
+            st.caption(metadata)
+else:
+    st.info("Global market news currently unavailable.")
+
+# ==============================
+# Market-Moving News Section
+# ==============================
+st.subheader("⚡ Today's Market-Moving News")
+st.caption("Sources: Yahoo Finance, Moneycontrol, Google News - Prioritized by geopolitics, macro, commodities, politics")
+
+market_news = get_market_impact_news("Nifty 50", "NIFTY.NS", limit=5, only_today=True)
+
+if market_news:
+    for news in market_news:
+        headline = news['title']
+        link = news['link']
+        publisher = news['publisher']
+        tags = news.get('impact_tags', [])
+        published_at = news['published_at']
+
+        if link:
+            st.markdown(f"• [{headline}]({link})")
+        else:
+            st.markdown(f"• {headline}")
+
+        # Display impact tags as badges
+        if tags:
+            tag_str = " • ".join(tags)
+            metadata = f"🏷️ {tag_str} • {publisher} • {published_at}"
+        else:
+            metadata = f"📰 {publisher} • {published_at}"
+        st.caption(metadata)
+else:
+    st.info("Market-moving news currently unavailable.")
+
+st.divider()
+st.subheader("Select Stock for Analysis")
 stock_options = {
     "Adani Enterprises": "ADANIENT.NS",
     "Adani Ports & SEZ": "ADANIPORTS.NS",
@@ -590,6 +684,12 @@ if not selected_stock:
 
 ticker = stock_options[selected_stock]
 
+# Reset proceed state when stock changes
+if st.session_state.get("last_selected_stock") != selected_stock:
+    st.session_state["proceed_clicked"] = False
+    st.session_state["trained_context"] = None
+    st.session_state["last_selected_stock"] = selected_stock
+
 st.caption("Covered companies: all current Nifty 50 constituents")
 
 today = datetime.today()
@@ -605,15 +705,38 @@ st.caption(f"End Date is fixed to current date: {end_date.strftime('%d %b %Y')}"
 
 seed = st.number_input("Random Seed", min_value=1, max_value=999999, value=42, step=1)
 
+# ==============================
+# 🔘 PROCEED BUTTON
+# ==============================
+
+# Check if we've already been clicked before
+if "proceed_clicked" not in st.session_state:
+    st.session_state["proceed_clicked"] = False
+
+# Show the button
+proceed_button = st.button("Proceed with Analysis", type="primary")
+
+# If button is clicked now, mark it
+if proceed_button:
+    st.session_state["proceed_clicked"] = True
+
+# If we haven't been clicked yet, stop execution here
+if not st.session_state["proceed_clicked"]:
+    st.info("👆 Click the 'Proceed with Analysis' button to load data and start the prediction process.")
+    st.stop()
+
+# ==============================
+# 📥 LOAD DATA (After Proceed Button)
+# ==============================
+
 if start_date >= end_date:
     st.error("Start date must be before current date")
     st.stop()
 
-# ==============================
-# 📥 LOAD DATA
-# ==============================
 data = get_cached_data(ticker, start=start_date, end=end_date)
 raw_data = data.copy()
+
+# Load full history only after proceed button is clicked
 full_history = get_cached_full_history(ticker, end=today)
 
 if raw_data.empty or extract_close_series(raw_data).empty:
@@ -628,6 +751,7 @@ selected_close = extract_close_series(raw_data)
 if full_close.empty:
     st.warning("Full historical series is unavailable right now; using selected timeline for all-time metrics.")
     full_close = selected_close.copy()
+
 
 all_time_high_date = full_close.idxmax()
 all_time_high = float(full_close.max())
@@ -685,36 +809,6 @@ week_col2.metric(
     delta_color="inverse"
 )
 
-st.subheader("Today's Market-Moving News")
-market_news = get_market_impact_news(selected_stock, ticker, limit=20, only_today=True)
-
-if market_news:
-    st.caption(
-        "Sources: Yahoo Finance, Moneycontrol, and Google News market searches. "
-        "Feed is filtered to today and prioritized by market impact (war, geopolitics, politics, macro, commodities, and company-specific updates)."
-    )
-    for news in market_news:
-        headline = news["title"]
-        link = news["link"]
-        publisher = news["publisher"]
-        published_at = news["published_at"]
-        related_tickers = news["related_tickers"]
-        tags = news.get("impact_tags", [])
-
-        if link:
-            st.markdown(f"- [{headline}]({link})")
-        else:
-            st.markdown(f"- {headline}")
-
-        metadata = f"{publisher} • {published_at}"
-        if tags:
-            metadata += f" • Tags: {', '.join(tags[:3])}"
-        if related_tickers:
-            metadata += f" • Related: {', '.join(related_tickers[:5])}"
-        st.caption(metadata)
-else:
-    st.info("No market-impact headlines from today are available right now. Please check again later.")
-
 st.subheader("Data & Model Health")
 health_col1, health_col2, health_col3, health_col4 = st.columns(4)
 health_col1.metric("Rows Downloaded", f"{len(raw_data)}")
@@ -728,9 +822,13 @@ health_col4.metric("Close Data Points", f"{len(selected_close)}")
 processed_data = get_cached_features(data)
 
 feature_cols = [
-    'Close', 'MA20', 'MA50', 'MA100', 'EMA20', 'RSI',
+    'Close', 'MA20', 'MA50', 'MA100', 'EMA20', 'EMA50', 'RSI',
     'ATR14', 'BollingerUpper', 'BollingerLower', 'BollingerWidth',
-    'VolumeChange', 'OBV', 'Volatility20'
+    'MACD', 'MACD_Signal', 'MACD_Histogram',
+    'Stochastic_K', 'Stochastic_D',
+    'VolumeChange', 'OBV', 'OBV_EMA', 'Volatility20',
+    'Close_Lag1', 'Close_Lag5', 'Return_Lag1', 'Return_Lag5',
+    'Williams_R', 'CCI'
 ]
 
 if len(processed_data) < 61:
@@ -840,6 +938,17 @@ if st.button("Train Model"):
         )
         next_day_price = returns_to_price(next_day_return, [[full_training['last_close']]])
 
+        # Generate 10-day ahead forecast
+        ten_day_forecast = predict_multi_step_lstm(
+            prod_model,
+            full_training['latest_feature_window'],
+            full_training['feature_scaler'],
+            full_training['target_scaler'],
+            processed_data,
+            feature_cols,
+            n_steps=10
+        )
+
         residuals = lstm_metrics['residuals']
         low_q, high_q = np.percentile(residuals, [5, 95])
         next_price_point = float(next_day_price[0][0])
@@ -879,6 +988,7 @@ if st.button("Train Model"):
         "current_price": float(selected_close.iloc[-1]),
         "next_price": next_price_point,
         "next_price_interval": (float(next_price_interval[0]), float(next_price_interval[1])),
+        "ten_day_forecast": ten_day_forecast,
         "dates": dates_test,
         "actual_price": actual_price,
         "pred_price": pred_price,
@@ -913,6 +1023,62 @@ if trained_outputs:
 
     interval_low, interval_high = trained_outputs['next_price_interval']
     st.info(f"Next-day uncertainty range (residual 90% band): ₹{interval_low:.2f} to ₹{interval_high:.2f}")
+
+    # ==============================
+    # 📅 10-DAY FORECAST
+    # ==============================
+    st.subheader("10-Day Price Forecast")
+    st.caption("Recursive forecasting using trained LSTM model for the next 10 trading days")
+    
+    forecast_data = trained_outputs.get('ten_day_forecast', [])
+    if forecast_data:
+        # Group predictions by date to handle any duplicates
+        from collections import defaultdict
+        date_prices = defaultdict(list)
+        date_returns = {}
+        
+        for pred in forecast_data:
+            date_key = pred['date'].strftime('%d %b %Y')
+            date_prices[date_key].append(pred['price'])
+            if date_key not in date_returns:
+                date_returns[date_key] = pred['return']
+        
+        # Create a dataframe with ranges for duplicate dates
+        forecast_rows = []
+        for date_key in sorted(date_prices.keys(), key=lambda x: datetime.strptime(x, '%d %b %Y')):
+            prices = sorted(date_prices[date_key])
+            if len(prices) == 1:
+                price_str = f"₹{prices[0]:.2f}"
+            else:
+                price_str = f"₹{prices[0]:.2f} - ₹{prices[-1]:.2f}"
+            
+            forecast_rows.append({
+                'Date': date_key,
+                'Predicted Price': price_str,
+                'Expected Return (%)': f"{date_returns[date_key]:.2f}%"
+            })
+        
+        forecast_df = pd.DataFrame(forecast_rows)
+        
+        # Display as table
+        st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+        
+        # Display as chart (using unique dates)
+        forecast_fig, forecast_ax = plt.subplots(figsize=(12, 5))
+        dates_forecast = sorted(set(pred['date'] for pred in forecast_data))
+        prices_forecast = [np.mean(date_prices[d.strftime('%d %b %Y')]) for d in dates_forecast]
+        
+        forecast_ax.plot(dates_forecast, prices_forecast, marker='o', color='#22c55e', linewidth=2.5, markersize=8, label='10-Day Forecast')
+        forecast_ax.axhline(trained_outputs['current_price'], color='#3b82f6', linestyle='--', linewidth=2, label=f"Current Price (₹{trained_outputs['current_price']:.2f})")
+        forecast_ax.fill_between(dates_forecast, prices_forecast, trained_outputs['current_price'], alpha=0.2, color='#22c55e')
+        
+        forecast_ax.set_xlabel("Date")
+        forecast_ax.set_ylabel("Stock Price (₹)")
+        forecast_ax.set_title(f"{selected_stock} - 10-Day Forecast")
+        forecast_ax.grid(True, linestyle="--", linewidth=0.7, alpha=0.35)
+        forecast_ax.legend(loc="best", frameon=False)
+        forecast_fig.autofmt_xdate(rotation=45)
+        st.pyplot(forecast_fig, clear_figure=True)
 
     ci95 = trained_outputs.get('ci95', {})
     if ci95 and ci95.get('rmse'):
@@ -958,6 +1124,57 @@ if trained_outputs:
     fig.autofmt_xdate(rotation=45)
     ax.legend(loc="upper left", frameon=False)
     st.pyplot(fig, clear_figure=True)
+
+    # ==============================
+    # 📊 PREDICTION ACCURACY ANALYSIS
+    # ==============================
+    st.subheader("Prediction Accuracy Analysis")
+    
+    actual = trained_outputs["actual_price"].flatten()
+    predicted = trained_outputs["pred_price"].flatten()
+    
+    # Calculate percentage errors for sample predictions
+    pct_errors = np.abs((actual - predicted) / actual * 100)
+    
+    # Create comparison table for first 10 predictions
+    comparison_data = []
+    for i in range(min(10, len(actual))):
+        comparison_data.append({
+            'Date': trained_outputs["dates"][i].strftime('%d %b %Y'),
+            'Actual Price (₹)': f"{actual[i]:.2f}",
+            'Predicted Price (₹)': f"{predicted[i]:.2f}",
+            'Difference (₹)': f"{abs(actual[i] - predicted[i]):.2f}",
+            'Error (%)': f"{pct_errors[i]:.2f}%"
+        })
+    
+    st.write("**Sample of Recent Predictions vs Actual:**")
+    comparison_df = pd.DataFrame(comparison_data)
+    st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+    
+    # Accuracy metrics
+    avg_error_pct = np.mean(pct_errors)
+    if avg_error_pct < 1.0:
+        accuracy_level = "🟢 Excellent (< 1% error)"
+    elif avg_error_pct < 2.0:
+        accuracy_level = "🟢 Very Good (1-2% error)"
+    elif avg_error_pct < 3.0:
+        accuracy_level = "🟡 Good (2-3% error)"
+    else:
+        accuracy_level = "🔴 Fair (> 3% error)"
+    
+    acc_col1, acc_col2, acc_col3 = st.columns(3)
+    acc_col1.metric("Average Error %", f"{avg_error_pct:.2f}%", help="Lower is better")
+    acc_col2.metric("Accuracy Level", accuracy_level.split()[0], help=accuracy_level)
+    acc_col3.metric("Correct Direction", f"{trained_outputs['directional_accuracy']:.1f}%", help="Percentage of up/down predictions correct")
+    
+    if avg_error_pct > 2.5:
+        st.warning(
+            f"⚠️ **Model Accuracy Note**: Average error is {avg_error_pct:.2f}%. "
+            "For better predictions: "
+            "(1) Use longer historical data (select earlier start date), "
+            "(2) Increase random seed for different patterns, "
+            "(3) Check that selected date range has stable market conditions"
+        )
 
     st.subheader("Model Diagnostics")
     residual_fig, residual_ax = plt.subplots(figsize=(14, 3.8))

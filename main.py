@@ -6,9 +6,13 @@ import matplotlib.pyplot as plt
 
 
 FEATURE_COLS = [
-    'Close', 'MA20', 'MA50', 'MA100', 'EMA20', 'RSI',
+    'Close', 'MA20', 'MA50', 'MA100', 'EMA20', 'EMA50', 'RSI',
     'ATR14', 'BollingerUpper', 'BollingerLower', 'BollingerWidth',
-    'VolumeChange', 'OBV', 'Volatility20'
+    'MACD', 'MACD_Signal', 'MACD_Histogram',
+    'Stochastic_K', 'Stochastic_D',
+    'VolumeChange', 'OBV', 'OBV_EMA', 'Volatility20',
+    'Close_Lag1', 'Close_Lag5', 'Return_Lag1', 'Return_Lag5',
+    'Williams_R', 'CCI'
 ]
 
 def main():
